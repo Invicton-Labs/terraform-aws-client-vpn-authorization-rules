@@ -38,6 +38,8 @@ For each rule:
 2. If there's nothing smaller within the CIDR or larger that covers the CIDR, AND there's an everyone rule that covers it, delete it (done in rules_with_everyone_duplicates_removed)
 3. If there's a smaller one within the CIDR for another group, add that smaller one specifically (done in rules_with_additional_cidrs)
 4. If a larger CIDR is entirely completed by smaller CIDRs that are required, delete the larger one (done in rules_with_unnecessary_larger_removed)
+
+NOTE: we use ternary operators instead of &&/|| throughout because it enables lazy evaluation, thereby speeding up the process by not running unnecessary checks.
 */
 
 // Start by reducing all rules within each group to the minimum set.
@@ -67,7 +69,7 @@ locals {
       {
         group_id    = group_id
         cidr        = cidr_data.cidr
-        description = join(var.merged_rule_description_joiner, [for contained in cidr_data.contains : contained.metadata.description])
+        description = join(var.merged_rule_description_joiner, [for contained in cidr_data.contains : "${contained.metadata.description} [${contained.cidr}]"])
         first_ip    = cidrhost(cidr_data.cidr, 0)
         last_ip     = cidrhost(cidr_data.cidr, pow(2, 32 - tonumber(split("/", cidr_data.cidr)[1])) - 1)
       }
@@ -86,76 +88,42 @@ locals {
     ]
   }
 
-  // Add a field that indicates if this rule is covered by an everyone group rule,
-  // i.e. if an everyone rule would provide the same access if this rule didn't exist.
-  rules_with_everyone_meta = {
+  // Remove any rules that are covered by "everyone" rules. This is possible because:
+  // - any smaller rules that are subsets of a given rule will also be removed if the given rule
+  //   is removed, as it will also be covered by the same everyone rule. Therefore, there is no
+  //   need to duplicate the longer prefix path of that smaller rule.
+  // - any larger rule that subsumes a given rule, which is also covered by an everyone rule,
+  //   will also be removed. Therefore, there is no reason to keep this smaller prefix path rule.
+  // - any larger rule that is larger than the everyone rule will not be considered in AWS routing
+  //   evaluation, as the everyone rule will have a longer prefix length and will be considered first.
+  rules_with_everyone_duplicates_removed = contains(keys(local.rules_with_first_last_decimal), local.everyone_group_uuid) ? {
     for group_id, rules in local.rules_with_first_last_decimal :
-    group_id => [
-      for rule in rules :
-      merge(rule, {
-        covered_by_everyone_rule = length([
-          for everyone_rule in local.rules_with_first_last_decimal[local.everyone_group_uuid] :
-          true
-          if(
-            rule.group_id != local.everyone_group_uuid ? (
-              everyone_rule.first_ip_decimal <= rule.first_ip_decimal ? (
-                everyone_rule.last_ip_decimal >= rule.last_ip_decimal
-              ) : false
-            ) : false
-          )
-        ]) > 0
-      })
-    ]
-  }
-
-  // Create a flat list of all rules across all groups.
-  all_rules_with_everyone_meta = concat(values(local.rules_with_everyone_meta)...)
-
-  // Remove any rules where the same access is granted by an everyone rule.
-  // There are many conditions to doing this, check the comments within.
-  rules_with_everyone_duplicates_removed = {
-    for group_id, rules in local.rules_with_everyone_meta :
     group_id => [
       for rule in rules :
       rule
       if(
         // If it's an everyone group rule, it has to remain
-        group_id == local.everyone_group_uuid ||
-        // Always include it if it's not subsumed by an everyone rule
-        !rule.covered_by_everyone_rule ||
-        // OR, if there's any other CIDR from a different group that includes this one, or is a part of this one.
-        length([
-          for compare_rule in local.all_rules_with_everyone_meta :
-          true
-          if(
-            // The rule has to be for a different group to qualify
-            compare_rule.group_id != rule.group_id &&
-            // That other group can't be the everyone group, since we're considering deleting in favour of the everyone group rule
-            compare_rule.group_id != local.everyone_group_uuid &&
-            // The rule can't be one that is covered by an everyone rule, since we'd like to disappear that rule too.
-            !compare_rule.covered_by_everyone_rule &&
-            (
-              // The other rule subsumes this rule, OR
-              (compare_rule.first_ip_decimal <= rule.first_ip_decimal && compare_rule.last_ip_decimal >= rule.last_ip_decimal) ||
-              // The other rule is subsumed by this one
-              (rule.first_ip_decimal <= compare_rule.first_ip_decimal && rule.last_ip_decimal >= compare_rule.last_ip_decimal)
-            ) &&
-            // There can't be an everyone rule that is the same size or smaller than the compare rule
-            length([
-              for everyone_rule in local.rules_with_first_last_decimal[local.everyone_group_uuid] :
-              true
-              if(
-                // The everyone rule has to subsume this rule
-                (everyone_rule.first_ip_decimal <= rule.first_ip_decimal && everyone_rule.last_ip_decimal >= rule.last_ip_decimal) &&
-                // The everyone rule has to be subsumed by the compare rule
-                (compare_rule.first_ip_decimal <= everyone_rule.first_ip_decimal && compare_rule.last_ip_decimal >= everyone_rule.last_ip_decimal)
-              )
-            ]) == 0
-          )
-        ]) > 0
+        group_id == local.everyone_group_uuid ? true : (
+          // Always include it if it's not subsumed by an everyone rule
+          length([
+            for everyone_rule in local.rules_with_first_last_decimal[local.everyone_group_uuid] :
+            true
+            if(
+              rule.group_id != local.everyone_group_uuid ? (
+                everyone_rule.first_ip_decimal <= rule.first_ip_decimal ? (
+                  everyone_rule.last_ip_decimal >= rule.last_ip_decimal
+                ) : false
+              ) : false
+            )
+          ]) == 0
+        )
       )
     ]
-  }
+    // If there are no everyone rules, skip and move on
+  } : local.rules_with_first_last_decimal
+
+  // Create a flat list of all rules across all groups.
+  all_rules_with_everyone_meta = concat(values(local.rules_with_everyone_duplicates_removed)...)
 
   // For each rule, add additional rules to match any longer-prefix rules for other groups.
   rules_with_additional_cidrs = {
@@ -169,20 +137,23 @@ locals {
         ], [
         for compare_rule in local.all_rules_with_everyone_meta :
         merge(compare_rule, {
-          description              = "${rule.description} (covering longest prefix path from \"${compare_rule.description}\")"
+          description              = "${rule.description} (covering longer prefix path from \"${compare_rule.description}\")"
           group_id                 = rule.group_id
           extra_due_to_other_group = true
         })
         if(
           // Only consider rules from other groups
-          compare_rule.group_id != rule.group_id &&
-          // That other group can't be the everyone group, since the everyone group would provide access
-          // to this group as well anyways.
-          compare_rule.group_id != local.everyone_group_uuid &&
-          // We don't need to add a duplicate of the compare rule for this rule if it's identical, since that wouldn't accomplish anything.
-          !(compare_rule.first_ip_decimal == rule.first_ip_decimal && compare_rule.last_ip_decimal == rule.last_ip_decimal) &&
-          // The compare rule needs to be subsumed by this rule (longer prefix length).
-          (rule.first_ip_decimal <= compare_rule.first_ip_decimal && rule.last_ip_decimal >= compare_rule.last_ip_decimal)
+          compare_rule.group_id != rule.group_id ? (
+            // That other group can't be the everyone group, since the everyone group would provide access
+            // to this group as well anyways.
+            compare_rule.group_id != local.everyone_group_uuid ? (
+              // We don't need to add a duplicate of the compare rule for this rule if it's identical, since that wouldn't accomplish anything.
+              !(compare_rule.first_ip_decimal == rule.first_ip_decimal ? compare_rule.last_ip_decimal == rule.last_ip_decimal : false) ? (
+                // The compare rule needs to be subsumed by this rule (longer prefix length).
+                (rule.first_ip_decimal <= compare_rule.first_ip_decimal ? rule.last_ip_decimal >= compare_rule.last_ip_decimal : false)
+              ) : false
+            ) : false
+          ) : false
         )
       ])
     ])
@@ -230,14 +201,15 @@ locals {
       rule
       if(
         // Keep it if it had to be added due to a smaller prefix in another group
-        rule.extra_due_to_other_group ||
-        (
-          // Keep it if none of the merged CIDRs of required added rules subsume this CIDR
-          length([
-            for compare_rule in module.merge_cidr_for_redundancy_check.merged_cidr_sets_ipv4_with_meta[group_id] :
-            true
-            if(compare_rule.first_ip_decimal <= rule.first_ip_decimal && compare_rule.last_ip_decimal >= rule.last_ip_decimal)
-          ]) == 0
+        rule.extra_due_to_other_group ? true : (
+          (
+            // Keep it if none of the merged CIDRs of required added rules subsume this CIDR
+            length([
+              for compare_rule in module.merge_cidr_for_redundancy_check.merged_cidr_sets_ipv4_with_meta[group_id] :
+              true
+              if(compare_rule.first_ip_decimal <= rule.first_ip_decimal ? compare_rule.last_ip_decimal >= rule.last_ip_decimal : false)
+            ]) == 0
+          )
         )
       )
     ]
@@ -253,16 +225,4 @@ locals {
       description          = rule.description
     }
   }
-
-  # TODO: replace and/or with ternary
 }
-
-// If desired, create the rules
-# resource "aws_ec2_client_vpn_authorization_rule" "this" {
-#   for_each               = var.create_rules ? local.all_rules : {}
-#   client_vpn_endpoint_id = var.client_vpn_endpoint_id
-#   target_network_cidr    = each.value.target_network_cidr
-#   authorize_all_groups   = each.value.authorize_all_groups
-#   access_group_id        = each.value.access_group_id
-#   description            = each.value.description
-# }

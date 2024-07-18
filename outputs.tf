@@ -5,10 +5,6 @@ output "authorization_rules" {
   description = "The value of the `authorization_rules` input variable."
   value       = var.authorization_rules
 }
-output "client_vpn_endpoint_id" {
-  description = "The value of the `client_vpn_endpoint_id` input variable."
-  value       = var.client_vpn_endpoint_id
-}
 output "merged_rule_description_joiner" {
   description = "The value of the `merged_rule_description_joiner` input variable, or the default value if the input was `null`."
   value       = var.merged_rule_description_joiner
@@ -21,10 +17,6 @@ output "merged_authorization_rules" {
   description = "The reduced/merged inputs that can/will be used to create the actual rules."
   value       = local.all_rules
 }
-# output "authorization_rule_resources" {
-#   description = "The aws_ec2_client_vpn_authorization_rule resources that were created, if the `create_rules` input variable was `true` (otherwise, `null`)."
-#   value       = var.create_rules ? aws_ec2_client_vpn_authorization_rule.this : null
-# }
 
 //==================================================
 //             Debugging outputs
@@ -44,21 +36,18 @@ output "merged_authorization_rules" {
 # output "_05_rules_with_first_last_decimal" {
 #   value = local.rules_with_first_last_decimal
 # }
-# output "_06_rules_with_everyone_meta" {
-#   value = local.rules_with_everyone_meta
-# }
-# output "_07_rules_with_everyone_duplicates_removed" {
+# output "_06_rules_with_everyone_duplicates_removed" {
 #   value = local.rules_with_everyone_duplicates_removed
 # }
-# output "_08_rules_with_additional_cidrs" {
+# output "_07_rules_with_additional_cidrs" {
 #   value = local.rules_with_additional_cidrs
 # }
-# output "_09_rules_with_additional_cidrs_distinct" {
+# output "_08_rules_with_additional_cidrs_distinct" {
 #   value = local.rules_with_additional_cidrs_distinct
 # }
-# output "_10_merge_cidr_for_redundancy_check" {
+# output "_09_merge_cidr_for_redundancy_check" {
 #   value = module.merge_cidr_for_redundancy_check.merged_cidr_sets_ipv4_with_meta
 # }
-# output "_11_rules_with_unnecessary_larger_removed" {
+# output "_10_rules_with_unnecessary_larger_removed" {
 #   value = local.rules_with_unnecessary_larger_removed
 # }
